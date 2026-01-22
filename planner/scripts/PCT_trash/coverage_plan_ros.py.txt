@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""
+Coverage Path Planner ROS2 Node
+覆盖路径规划 ROS2 节点
+
+与 tomography.py 配合使用，通过 rviz2 加载 pct_ros.rviz 进行可视化。
+
+发布:
+- /pct_path: 完整覆盖轨迹（与 plan.py 兼容，可在现有 rviz 配置中显示）
+- /coverage_paths_markers: 各选中路径的可视化 Marker
+- /coverage_map_markers: 覆盖地图可视化
+
+使用方法:
+1. 启动 tomography: python tomography.py --scene Spiral
+2. 启动 rviz2: rviz2 -d /path/to/pct_ros.rviz
+3. 启动本节点: python coverage_plan_ros.py --scene Spiral
+"""
+import sys
+import argparse
+import numpy as np
+
+import rclpy
+np.random.seed(42)  # 保证可重复性
+from rclpy.node import Node
+from rclpy.qos import QoSProfile
+from nav_msgs.msg import Path
+from geometry_msgs.msg import Point
+from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import ColorRGBA
+
+from utils import *
+from coverage_planner import CoveragePathPlanner, create_coverage_planner
+
+sys.path.append('../')
+from config import Config
+
+
+class CoveragePlannerNode(Node):
+    """覆盖路径规划 ROS2 节点
+    
+    支持两种模式:
+    - 原始模式 (method='coverage'): 集合覆盖算法，生成一条完整轨迹
+    - 论文模式 (method='sparse'): 稀疏轨迹采样算法，生成 S 条独立轨迹
+    """
+    
+    def __init__(self, scene: str, coverage_radius: float, waypoint_spacing: float,
+                 connection_mode: str, plan_connections: bool,
+                 target_coverage: float, max_paths: int,
+                 method: str = 'sparse', n_samples: int = 100,
+                 k_clusters: int = 30, s_trajectories: int = 3,
+                 smooth: bool = True, smooth_factor: float = 0.0,
+                 interleaved: bool = True):
+        super().__init__('coverage_path_planner')
+        
+        self.scene = scene
+        self.coverage_radius = coverage_radius
+        self.waypoint_spacing = waypoint_spacing
+        self.connection_mode = connection_mode
+        self.plan_connections = plan_connections
+        self.target_coverage = target_coverage
+        self.max_paths = max_paths
+        self.method = method
+        self.n_samples = n_samples
+        self.k_clusters = k_clusters
+        self.s_trajectories = s_trajectories
+        self.smooth = smooth
+        self.smooth_factor = smooth_factor
+        self.interleaved = interleaved
+        
+        # QoS profile - 使用默认设置以兼容 ros2 topic echo
+        qos_profile = 10  # 使用默认 QoS，depth=10
+        
+        # Publishers
+        # /pct_path: 主轨迹（论文模式下发布所有轨迹合并后的结果）
+        # /pct_path_1, /pct_path_2, ...: 各条独立轨迹（论文模式）
+        self.path_pub = self.create_publisher(Path, '/pct_path', qos_profile)
+        self.paths_marker_pub = self.create_publisher(MarkerArray, '/coverage_paths_markers', qos_profile)
+        self.coverage_map_pub = self.create_publisher(MarkerArray, '/coverage_map_markers', qos_profile)
+        
+        # 为每条独立轨迹创建发布者（论文模式）
+        self.trajectory_pubs = []
+        for i in range(s_trajectories):
+            pub = self.create_publisher(Path, f'/pct_path_{i+1}', qos_profile)
+            self.trajectory_pubs.append(pub)
+        
+        self.get_logger().info(f'Coverage Planner Node initialized')
+        self.get_logger().info(f'  Scene: {scene}')
+        self.get_logger().info(f'  Method: {method}')
+        
+        if method == 'sparse':
+            mode_str = "交错（全图覆盖）" if interleaved else "连续（区域划分）"
+            self.get_logger().info(f'  [论文模式] n_samples={n_samples}, k_clusters={k_clusters}, s_trajectories={s_trajectories}')
+            self.get_logger().info(f'  [论文模式] 分配模式: {mode_str}（默认连续）')
+        else:
+            self.get_logger().info(f'  [原始模式] coverage_radius={coverage_radius}m, target_coverage={target_coverage*100:.0f}%')
+        
+        # 创建规划器
+        self.planner = create_coverage_planner(
+            scene=scene,
+            coverage_radius=coverage_radius
+        )
+        
+        # 存储规划结果
+        self.trajectory = None
+        self.trajectories = []  # 论文模式：多条轨迹
+        self.path_msg = None
+        self.path_msgs = []  # 论文模式：多条轨迹消息
+        
+        # 运行规划
+        self.get_logger().info('Starting coverage path planning...')
+        if method == 'sparse':
+            self.run_sparse_planning()
+        else:
+            self.run_planning()
+        
+        # 创建定时器，每0.5秒发布一次（确保能被订阅者接收）
+        self.publish_timer = self.create_timer(0.5, self.publish_trajectory)
+        self.get_logger().info('Timer created, publishing every 0.5s')
+    
+    def publish_trajectory(self):
+        """定时发布轨迹"""
+        if self.path_msg is not None:
+            self.path_pub.publish(self.path_msg)
+        
+        # 发布各条独立轨迹（论文模式）
+        for i, msg in enumerate(self.path_msgs):
+            if i < len(self.trajectory_pubs):
+                self.trajectory_pubs[i].publish(msg)
+    
+    def run_sparse_planning(self):
+        """论文模式：生成 S 条稀疏轨迹"""
+        trajectories = self.planner.run_sparse_trajectories(
+            n_samples=self.n_samples,
+            k_clusters=self.k_clusters,
+            s_trajectories=self.s_trajectories,
+            smooth=self.smooth,
+            smooth_factor=self.smooth_factor,
+            interleaved=self.interleaved
+        )
+        
+        
+        if not trajectories:
+            self.get_logger().error('Planning failed!')
+            return
+        self.trajectories = trajectories
+        
+        # 创建各条轨迹的消息
+        self.path_msgs = []
+        total_points = 0
+        for i, traj in enumerate(trajectories):
+            msg = traj2ros(traj, self.get_clock())
+            self.path_msgs.append(msg)
+            total_points += len(traj)
+            self.get_logger().info(f'  Trajectory {i+1}: {len(traj)} points -> /pct_path_{i+1}')
+        
+        # 合并所有轨迹发布到 /pct_path
+        if trajectories:
+            combined = np.vstack(trajectories)
+            self.trajectory = combined
+            self.path_msg = traj2ros(combined, self.get_clock())
+        
+        self.get_logger().info(f'Sparse planning completed!')
+        self.get_logger().info(f'  Total trajectories: {len(trajectories)}')
+        self.get_logger().info(f'  Total points: {total_points}')
+        
+        # 发布各轨迹的可视化 Marker
+        self.publish_sparse_trajectories_markers(trajectories)
+    
+    def publish_sparse_trajectories_markers(self, trajectories):
+        """发布稀疏轨迹的可视化 Marker"""
+        marker_array = MarkerArray()
+        
+        colors = [
+            (1.0, 0.0, 0.0),  # 红
+            (0.0, 1.0, 0.0),  # 绿
+            (0.0, 0.0, 1.0),  # 蓝
+            (1.0, 1.0, 0.0),  # 黄
+            (1.0, 0.0, 1.0),  # 紫
+            (0.0, 1.0, 1.0),  # 青
+            (1.0, 0.5, 0.0),  # 橙
+            (0.5, 0.0, 1.0),  # 紫蓝
+        ]
+        
+        for i, traj in enumerate(trajectories):
+            if len(traj) == 0:
+                continue
+            
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = "sparse_trajectories"
+            marker.id = i
+            marker.type = Marker.LINE_STRIP
+            marker.action = Marker.ADD
+            marker.scale.x = 0.15  # 线宽
+            
+            color = colors[i % len(colors)]
+            marker.color.r = color[0]
+            marker.color.g = color[1]
+            marker.color.b = color[2]
+            marker.color.a = 1.0
+            
+            for point in traj:
+                p = Point()
+                p.x = float(point[0])
+                p.y = float(point[1])
+                p.z = float(point[2]) + 0.1
+                marker.points.append(p)
+            
+            marker_array.markers.append(marker)
+        
+        self.paths_marker_pub.publish(marker_array)
+    
+    def run_planning(self):
+        """原始模式：运行规划并发布结果"""
+        # 运行自动覆盖规划
+        trajectory, selected_paths, coverage_rate = self.planner.run_auto(
+            waypoint_spacing=self.waypoint_spacing,
+            connection_mode=self.connection_mode,
+            plan_connections=self.plan_connections,
+            target_coverage=self.target_coverage,
+            min_new_coverage_ratio=0.2,
+            max_paths=self.max_paths
+        )
+        
+        if trajectory is None or len(trajectory) == 0:
+            self.get_logger().error('Planning failed!')
+            return
+        
+        self.trajectory = trajectory
+        self.get_logger().info(f'Planning completed!')
+        self.get_logger().info(f'  Selected paths: {len(selected_paths)}')
+        self.get_logger().info(f'  Trajectory points: {len(trajectory)}')
+        self.get_logger().info(f'  Coverage rate: {coverage_rate:.1f}%')
+        
+        # 创建消息（只创建一次，定时器会重复发布）
+        self.path_msg = traj2ros(trajectory, self.get_clock())
+        self.path_pub.publish(self.path_msg)
+        self.get_logger().info('Trajectory published to /pct_path')
+        
+        # 发布各路径的可视化
+        self.publish_paths_markers(selected_paths)
+        
+        # 发布覆盖地图
+        self.publish_coverage_map()
+    
+    def publish_paths_markers(self, selected_paths):
+        """发布各路径的可视化Marker"""
+        marker_array = MarkerArray()
+        
+        # 颜色列表，用于区分不同路径
+        colors = [
+            (1.0, 0.0, 0.0),  # 红
+            (0.0, 1.0, 0.0),  # 绿
+            (0.0, 0.0, 1.0),  # 蓝
+            (1.0, 1.0, 0.0),  # 黄
+            (1.0, 0.0, 1.0),  # 紫
+            (0.0, 1.0, 1.0),  # 青
+            (1.0, 0.5, 0.0),  # 橙
+            (0.5, 0.0, 1.0),  # 紫蓝
+        ]
+        
+        for i, path in enumerate(selected_paths):
+            color = colors[i % len(colors)]
+            
+            # 路径线条
+            line_marker = Marker()
+            line_marker.header.frame_id = "map"
+            line_marker.header.stamp = self.get_clock().now().to_msg()
+            line_marker.ns = "coverage_paths"
+            line_marker.id = i * 3
+            line_marker.type = Marker.LINE_STRIP
+            line_marker.action = Marker.ADD
+            line_marker.scale.x = 0.15  # 线宽
+            line_marker.color = ColorRGBA(r=color[0], g=color[1], b=color[2], a=0.8)
+            
+            for point in path.trajectory:
+                p = Point()
+                p.x = float(point[0])
+                p.y = float(point[1])
+                p.z = float(point[2])
+                line_marker.points.append(p)
+            
+            marker_array.markers.append(line_marker)
+            
+            # 起点球
+            start_marker = Marker()
+            start_marker.header.frame_id = "map"
+            start_marker.header.stamp = self.get_clock().now().to_msg()
+            start_marker.ns = "coverage_paths"
+            start_marker.id = i * 3 + 1
+            start_marker.type = Marker.SPHERE
+            start_marker.action = Marker.ADD
+            start_marker.pose.position.x = float(path.trajectory[0, 0])
+            start_marker.pose.position.y = float(path.trajectory[0, 1])
+            start_marker.pose.position.z = float(path.trajectory[0, 2])
+            start_marker.scale.x = 0.5
+            start_marker.scale.y = 0.5
+            start_marker.scale.z = 0.5
+            start_marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)  # 绿色起点
+            marker_array.markers.append(start_marker)
+            
+            # 终点球
+            end_marker = Marker()
+            end_marker.header.frame_id = "map"
+            end_marker.header.stamp = self.get_clock().now().to_msg()
+            end_marker.ns = "coverage_paths"
+            end_marker.id = i * 3 + 2
+            end_marker.type = Marker.SPHERE
+            end_marker.action = Marker.ADD
+            end_marker.pose.position.x = float(path.trajectory[-1, 0])
+            end_marker.pose.position.y = float(path.trajectory[-1, 1])
+            end_marker.pose.position.z = float(path.trajectory[-1, 2])
+            end_marker.scale.x = 0.5
+            end_marker.scale.y = 0.5
+            end_marker.scale.z = 0.5
+            end_marker.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)  # 红色终点
+            marker_array.markers.append(end_marker)
+            
+            # 路径文字标签
+            text_marker = Marker()
+            text_marker.header.frame_id = "map"
+            text_marker.header.stamp = self.get_clock().now().to_msg()
+            text_marker.ns = "path_labels"
+            text_marker.id = i
+            text_marker.type = Marker.TEXT_VIEW_FACING
+            text_marker.action = Marker.ADD
+            mid_idx = len(path.trajectory) // 2
+            text_marker.pose.position.x = float(path.trajectory[mid_idx, 0])
+            text_marker.pose.position.y = float(path.trajectory[mid_idx, 1])
+            text_marker.pose.position.z = float(path.trajectory[mid_idx, 2]) + 1.0
+            text_marker.scale.z = 0.8
+            text_marker.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
+            text_marker.text = f"P{path.path_id}"
+            marker_array.markers.append(text_marker)
+        
+        self.paths_marker_pub.publish(marker_array)
+    
+    def publish_coverage_map(self):
+        """发布覆盖地图可视化"""
+        coverage_map = self.planner.get_coverage_map()
+        
+        marker_array = MarkerArray()
+        
+        # 创建一个大的点云marker来显示覆盖情况
+        covered_marker = Marker()
+        covered_marker.header.frame_id = "map"
+        covered_marker.header.stamp = self.get_clock().now().to_msg()
+        covered_marker.ns = "coverage_map"
+        covered_marker.id = 0
+        covered_marker.type = Marker.POINTS
+        covered_marker.action = Marker.ADD
+        covered_marker.scale.x = self.planner.resolution * 0.8
+        covered_marker.scale.y = self.planner.resolution * 0.8
+        
+        uncovered_marker = Marker()
+        uncovered_marker.header.frame_id = "map"
+        uncovered_marker.header.stamp = self.get_clock().now().to_msg()
+        uncovered_marker.ns = "coverage_map"
+        uncovered_marker.id = 1
+        uncovered_marker.type = Marker.POINTS
+        uncovered_marker.action = Marker.ADD
+        uncovered_marker.scale.x = self.planner.resolution * 0.5
+        uncovered_marker.scale.y = self.planner.resolution * 0.5
+        
+        # 采样显示（避免点太多）
+        step = max(1, int(2.0 / self.planner.resolution))
+        
+        for row in range(0, coverage_map.shape[0], step):
+            for col in range(0, coverage_map.shape[1], step):
+                val = coverage_map[row, col]
+                if val > 0:
+                    world_pos = self.planner._grid2world(row, col)
+                    p = Point()
+                    p.x = float(world_pos[0])
+                    p.y = float(world_pos[1])
+                    p.z = 0.1
+                    
+                    if val == 2:  # 已覆盖
+                        covered_marker.points.append(p)
+                        covered_marker.colors.append(ColorRGBA(r=0.0, g=0.8, b=0.0, a=0.6))
+                    else:  # 未覆盖
+                        uncovered_marker.points.append(p)
+                        uncovered_marker.colors.append(ColorRGBA(r=0.8, g=0.0, b=0.0, a=0.3))
+        
+        if covered_marker.points:
+            marker_array.markers.append(covered_marker)
+        if uncovered_marker.points:
+            marker_array.markers.append(uncovered_marker)
+        
+        self.coverage_map_pub.publish(marker_array)
+
+
+def main(args=None):
+    parser = argparse.ArgumentParser(description='Coverage Path Planner ROS2 Node')
+    parser.add_argument('--scene', type=str, default='Spiral', 
+                        help='Scene name: Spiral, Building, Plaza')
+    
+    # 方法选择
+    parser.add_argument('--method', type=str, default='sparse',
+                        choices=['sparse', 'coverage'],
+                        help='Planning method: sparse (论文方法) or coverage (集合覆盖)')
+    
+    # 论文方法参数
+    parser.add_argument('--n_samples', type=int, default=100,
+                        help='[sparse] Total number of sample points')
+    parser.add_argument('--k_clusters', type=int, default=15,
+                        help='[sparse] Number of k-means clusters (representative points per trajectory)')
+    parser.add_argument('--s_trajectories', type=int, default=3,
+                        help='[sparse] Number of trajectories to generate')
+    parser.add_argument('--no_smooth', action='store_true',
+                        help='[sparse] Disable B-spline trajectory smoothing')
+    parser.add_argument('--smooth_factor', type=float, default=5.0,
+                        help='[sparse] B-spline smoothing factor (0=interpolate, >0=approximate, larger=smoother)')
+    parser.add_argument('--interleaved', action='store_true',
+                        help='[sparse] Use interleaved assignment for full coverage (default: continuous region assignment)')
+    
+    # 原始方法参数
+    parser.add_argument('--coverage_radius', type=float, default=5.0,
+                        help='[coverage] Coverage radius in meters')
+    parser.add_argument('--waypoint_spacing', type=float, default=10.0,
+                        help='[coverage] Waypoint grid spacing in meters')
+    parser.add_argument('--connection_mode', type=str, default='mixed',
+                        choices=['nearest', 'sweep_h', 'sweep_v', 'mixed'],
+                        help='[coverage] Start-end pair connection mode')
+    parser.add_argument('--no_plan_connections', action='store_true',
+                        help='[coverage] Disable planning for path connections')
+    parser.add_argument('--target_coverage', type=float, default=0.85,
+                        help='[coverage] Target coverage ratio (0-1)')
+    parser.add_argument('--max_paths', type=int, default=20,
+                        help='[coverage] Maximum number of paths')
+    
+    # 分离ROS参数和脚本参数
+    known_args, ros_args = parser.parse_known_args()
+    
+    rclpy.init(args=ros_args)
+    
+    node = CoveragePlannerNode(
+        scene=known_args.scene,
+        coverage_radius=known_args.coverage_radius,
+        waypoint_spacing=known_args.waypoint_spacing,
+        connection_mode=known_args.connection_mode,
+        plan_connections=not known_args.no_plan_connections,
+        target_coverage=known_args.target_coverage,
+        max_paths=known_args.max_paths,
+        method=known_args.method,
+        n_samples=known_args.n_samples,
+        k_clusters=known_args.k_clusters,
+        s_trajectories=known_args.s_trajectories,
+        smooth=not known_args.no_smooth,
+        smooth_factor=known_args.smooth_factor,
+        interleaved=known_args.interleaved
+    )
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+

@@ -20,4 +20,3 @@ class SceneSpiral():
     trav.cost_barrier = 50.0
     trav.safe_margin = 1.2
     trav.inflation = 0.2
-

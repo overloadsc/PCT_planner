@@ -1,9 +1,9 @@
 from .scene import ScenePCD, SceneMap, SceneTrav
 
 
-class ScenePlaza():
+class SceneOldtown():
     pcd = ScenePCD()
-    pcd.file_name = 'OldTown.pcd'
+    pcd.file_name = 'Oldtown.pcd'
 
     map = SceneMap()
     map.resolution = 0.25

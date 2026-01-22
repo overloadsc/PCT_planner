@@ -1,0 +1,1864 @@
+#!/usr/bin/env python3
+"""
+Coverage Path Planner (覆盖路径规划器)
+
+实现两种模式：
+1. 原始模式 (run_auto): 集合覆盖算法，生成一条完整轨迹
+2. 论文模式 (run_sparse_trajectories): 稀疏轨迹采样算法，生成 S 条独立轨迹
+
+论文模式核心算法:
+1. 混合采样 - n/2 自由空间均匀采样 + n/2 障碍物附近采样
+2. k-means 聚类 - 得到 K 个代表性点
+3. 随机分配 - 将代表点分配到 S 条轨迹子集
+4. TSP 排序 - 每条轨迹内部用 TSP 确定遍历顺序
+5. A* 路径规划 - 相邻代表点之间规划路径
+6. 轨迹生成 - 连接各段路径得到 S 条轨迹
+"""
+import os
+import sys
+import pickle
+import numpy as np
+from typing import List, Tuple, Set, Optional
+from dataclasses import dataclass, field
+from scipy.spatial.distance import cdist
+from scipy.interpolate import splprep, splev
+from sklearn.cluster import KMeans
+
+sys.path.append('../')
+from planner_wrapper import TomogramPlanner
+from config import Config
+
+rsg_root = os.path.dirname(os.path.abspath(__file__)) + '/../..'
+
+
+@dataclass
+class PathInfo:
+    """路径信息数据类"""
+    path_id: int
+    start_pos: np.ndarray
+    end_pos: np.ndarray
+    trajectory: np.ndarray  # 3D轨迹点 (N, 3)
+    covered_cells: Set[Tuple[int, int]] = field(default_factory=set)  # 覆盖的网格单元
+
+
+class CoveragePathPlanner:
+    """覆盖路径规划器
+    
+    实现基于贪心集合覆盖算法的路径规划，目标是用最少的路径覆盖整个可通行区域。
+    """
+    
+    def __init__(self, cfg, tomo_file: str, 
+                 coverage_radius: float = 1.0, 
+                 traversable_threshold: float = 50.0,
+                 verbose: bool = True):
+        """
+        Args:
+            cfg: 配置对象
+            tomo_file: tomogram文件名（不含.pickle后缀）
+            coverage_radius: 路径覆盖半径（米），路径上每个点会覆盖该半径内的区域
+            traversable_threshold: 可通行阈值，cost < threshold 视为可通行
+            verbose: 是否打印详细信息
+        """
+        self.cfg = cfg
+        self.tomo_file = tomo_file
+        self.coverage_radius = coverage_radius
+        self.traversable_threshold = traversable_threshold
+        self.verbose = verbose
+        
+        # 初始化底层路径规划器
+        self.planner = TomogramPlanner(cfg)
+        self.planner.loadTomogram(tomo_file)
+        
+        # 提取地图参数
+        self.resolution = self.planner.resolution
+        self.center = self.planner.center
+        self.map_dim = self.planner.map_dim
+        self.offset = self.planner.offset
+        
+        # 覆盖半径对应的网格数
+        self.coverage_cells = int(self.coverage_radius / self.resolution)
+        
+        # 提取可通行区域
+        self.traversable_cells: Set[Tuple[int, int]] = set()
+        self.trav_map: np.ndarray = None
+        self._extract_traversable_region()
+        
+        # 存储候选路径
+        self.candidate_paths: List[PathInfo] = []
+        
+        # 存储选中的路径
+        self.selected_paths: List[PathInfo] = []
+        
+        if self.verbose:
+            self._log(f"初始化完成:")
+            self._log(f"  - 地图分辨率: {self.resolution} m")
+            self._log(f"  - 地图尺寸: {self.map_dim}")
+            self._log(f"  - 覆盖半径: {self.coverage_radius} m ({self.coverage_cells} cells)")
+            self._log(f"  - 可通行阈值: {self.traversable_threshold}")
+    
+    def _log(self, msg: str):
+        """打印日志"""
+        if self.verbose:
+            print(f"[CoveragePlanner] {msg}")
+    
+    def _extract_traversable_region(self):
+        """从tomogram中提取可通行区域"""
+        tomo_dir = rsg_root + self.cfg.wrapper.tomo_dir
+        tomo_path = tomo_dir + self.tomo_file + '.pickle'
+        
+        with open(tomo_path, 'rb') as f:
+            data_dict = pickle.load(f)
+            self.tomogram = np.asarray(data_dict['data'], dtype=np.float32)
+        
+        # 使用第一层（layer 0）的traversability cost
+        self.trav_map = self.tomogram[0, 0]  # shape: (height, width)
+        
+        # 提取原始高度图 (ground elevation)，保留 NaN 用于边界检测
+        # tomogram[3] = elev_g (地面高度), shape: [n_slice, height, width]
+        self.height_map_raw = self.tomogram[3, 0]  # 保留 NaN
+        self.height_map = np.nan_to_num(self.height_map_raw, nan=-999.0)  # 转换用于计算
+        
+        # ========== 调试：打印 trav_map 的实际值分布 ==========
+        self._log(f"trav_map 调试信息:")
+        self._log(f"  - 范围: [{np.nanmin(self.trav_map):.2f}, {np.nanmax(self.trav_map):.2f}]")
+        self._log(f"  - cost >= 50 的网格数: {np.sum(self.trav_map >= 50)}")
+        self._log(f"  - cost >= 40 的网格数: {np.sum(self.trav_map >= 40)}")
+        self._log(f"  - cost >= 30 的网格数: {np.sum(self.trav_map >= 30)}")
+        self._log(f"  - cost >= 20 的网格数: {np.sum(self.trav_map >= 20)}")
+        self._log(f"  - cost >= 10 的网格数: {np.sum(self.trav_map >= 10)}")
+        self._log(f"  - cost > 0 的网格数: {np.sum(self.trav_map > 0)}")
+        
+        # 找到可通行的网格单元
+        # 条件1: traversability cost 小于阈值
+        # 条件2: 高度有效（非 NaN）- 这表示该位置有点云数据
+        trav_mask = self.trav_map < self.traversable_threshold
+        height_valid_mask = ~np.isnan(self.height_map_raw)  # 有点云的地方高度非 NaN
+        
+        traversable_mask = trav_mask & height_valid_mask
+        traversable_indices = np.argwhere(traversable_mask)
+        
+        # 转换为集合
+        all_traversable_cells = set(map(tuple, traversable_indices))
+        
+        # 统计（连通区域过滤前）
+        n_trav_only = np.sum(trav_mask)
+        n_with_height = np.sum(height_valid_mask)
+        n_before_filter = len(all_traversable_cells)
+        
+        if self.verbose:
+            total_cells = self.trav_map.size
+            self._log(f"可通行区域提取（连通区域过滤前）:")
+            self._log(f"  - 总网格数: {total_cells}")
+            self._log(f"  - trav cost < {self.traversable_threshold} 的网格: {n_trav_only}")
+            self._log(f"  - 有高度数据（点云覆盖）的网格: {n_with_height}")
+            self._log(f"  - 初步可通行网格数: {n_before_filter}")
+        
+        # ========== 连通区域过滤（已禁用）==========
+        # 问题：从边缘开始的 BFS 会把中庭、广场等区域错误标记为"室内"
+        # 解决：直接使用 traversability threshold，不做连通区域过滤
+        # self.traversable_cells = self._find_outdoor_connected_region(all_traversable_cells)
+        self.traversable_cells = all_traversable_cells  # 直接使用所有可通行区域
+        
+        n_after_filter = len(self.traversable_cells)
+        n_filtered = n_before_filter - n_after_filter
+        
+        if self.verbose:
+            self._log(f"连通区域过滤完成:")
+            self._log(f"  - 过滤前: {n_before_filter} 网格")
+            self._log(f"  - 过滤后（室外连通区域）: {n_after_filter} 网格")
+            self._log(f"  - 过滤掉（室内/隔离区域）: {n_filtered} 网格")
+            self._log(f"  - 最终可通行比例: {n_after_filter/total_cells*100:.1f}%")
+    
+    def _find_outdoor_connected_region(self, all_cells: Set[Tuple[int, int]]) -> Set[Tuple[int, int]]:
+        """使用 Flood Fill 找到室外连通区域
+        
+        策略：从地图边缘的可通行点开始 BFS，找到与边缘连通的区域
+        这样可以排除被墙壁隔离的室内区域
+        
+        Args:
+            all_cells: 所有可通行单元格
+        
+        Returns:
+            室外连通区域的单元格集合
+        """
+        if not all_cells:
+            return set()
+        
+        # 获取地图边界
+        rows = [c[0] for c in all_cells]
+        cols = [c[1] for c in all_cells]
+        min_row, max_row = min(rows), max(rows)
+        min_col, max_col = min(cols), max(cols)
+        
+        # 找到边缘上的可通行点作为种子点
+        # 优先选择地图四条边上的点
+        edge_cells = []
+        for cell in all_cells:
+            row, col = cell
+            # 检查是否在边缘附近（允许一定裕量）
+            margin = 5  # 边缘裕量（网格数）
+            is_edge = (row <= min_row + margin or row >= max_row - margin or
+                      col <= min_col + margin or col >= max_col - margin)
+            if is_edge:
+                edge_cells.append(cell)
+        
+        if not edge_cells:
+            # 如果边缘没有可通行点，尝试找到最大连通区域
+            if self.verbose:
+                self._log("  警告: 边缘无可通行点，将使用最大连通区域")
+            return self._find_largest_connected_region(all_cells)
+        
+        # 从所有边缘点开始做 BFS
+        visited = set()
+        queue = list(edge_cells)
+        for cell in edge_cells:
+            visited.add(cell)
+        
+        # 8 邻域方向
+        directions = [(-1, -1), (-1, 0), (-1, 1),
+                      (0, -1),           (0, 1),
+                      (1, -1),  (1, 0),  (1, 1)]
+        
+        while queue:
+            current = queue.pop(0)
+            row, col = current
+            
+            for dr, dc in directions:
+                neighbor = (row + dr, col + dc)
+                if neighbor in all_cells and neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+        
+        if self.verbose:
+            self._log(f"  Flood Fill 从 {len(edge_cells)} 个边缘点开始")
+            self._log(f"  找到 {len(visited)} 个连通的室外网格")
+        
+        return visited
+    
+    def _find_largest_connected_region(self, all_cells: Set[Tuple[int, int]]) -> Set[Tuple[int, int]]:
+        """找到最大的连通区域（备用方法）
+        
+        Args:
+            all_cells: 所有可通行单元格
+        
+        Returns:
+            最大连通区域的单元格集合
+        """
+        if not all_cells:
+            return set()
+        
+        remaining = all_cells.copy()
+        largest_region = set()
+        
+        # 8 邻域方向
+        directions = [(-1, -1), (-1, 0), (-1, 1),
+                      (0, -1),           (0, 1),
+                      (1, -1),  (1, 0),  (1, 1)]
+        
+        while remaining:
+            # 从剩余点中取一个作为种子
+            seed = next(iter(remaining))
+            
+            # BFS 找到该种子的连通区域
+            region = set()
+            queue = [seed]
+            region.add(seed)
+            
+            while queue:
+                current = queue.pop(0)
+                row, col = current
+                
+                for dr, dc in directions:
+                    neighbor = (row + dr, col + dc)
+                    if neighbor in remaining and neighbor not in region:
+                        region.add(neighbor)
+                        queue.append(neighbor)
+            
+            # 从剩余点中移除已处理的区域
+            remaining -= region
+            
+            # 更新最大区域
+            if len(region) > len(largest_region):
+                largest_region = region
+        
+        return largest_region
+    
+    def _grid2world(self, row: int, col: int) -> np.ndarray:
+        """网格坐标转世界坐标
+        
+        Args:
+            row: 行索引
+            col: 列索引
+        
+        Returns:
+            世界坐标 [x, y]
+        """
+        x = (col - self.offset[0]) * self.resolution + self.center[0]
+        y = (row - self.offset[1]) * self.resolution + self.center[1]
+        return np.array([x, y], dtype=np.float32)
+    
+    def _world2grid(self, pos: np.ndarray) -> Tuple[int, int]:
+        """世界坐标转网格坐标
+        
+        Args:
+            pos: 世界坐标 [x, y] 或 [x, y, z]
+        
+        Returns:
+            网格坐标 (row, col)
+        """
+        col = int(round((pos[0] - self.center[0]) / self.resolution)) + self.offset[0]
+        row = int(round((pos[1] - self.center[1]) / self.resolution)) + self.offset[1]
+        return (row, col)
+    
+    def _compute_path_coverage(self, trajectory: np.ndarray) -> Set[Tuple[int, int]]:
+        """计算路径覆盖的网格单元
+        
+        Args:
+            trajectory: 3D轨迹点 (N, 3)
+        
+        Returns:
+            覆盖的网格单元集合
+        """
+        covered = set()
+        r = self.coverage_cells
+        
+        for point in trajectory:
+            row, col = self._world2grid(point[:2])
+            
+            # 在覆盖半径内的所有单元
+            for dr in range(-r, r + 1):
+                for dc in range(-r, r + 1):
+                    # 可选：使用圆形而非正方形覆盖
+                    if dr*dr + dc*dc <= r*r:
+                        cell = (row + dr, col + dc)
+                        if cell in self.traversable_cells:
+                            covered.add(cell)
+        
+        return covered
+    
+    def generate_waypoints_grid(self, spacing: float = 5.0, 
+                                 margin: float = 2.0) -> List[np.ndarray]:
+        """在可通行区域生成均匀分布的路点
+        
+        用于自动生成起点终点对。
+        
+        Args:
+            spacing: 路点间距（米）
+            margin: 边缘裕量（米），避免在边界附近生成路点
+        
+        Returns:
+            路点列表（世界坐标）
+        """
+        spacing_cells = max(int(spacing / self.resolution), 1)
+        margin_cells = int(margin / self.resolution)
+        
+        waypoints = []
+        
+        # 获取可通行区域的边界
+        rows = [c[0] for c in self.traversable_cells]
+        cols = [c[1] for c in self.traversable_cells]
+        min_row, max_row = min(rows), max(rows)
+        min_col, max_col = min(cols), max(cols)
+        
+        # 按网格采样
+        for row in range(min_row + margin_cells, max_row - margin_cells, spacing_cells):
+            for col in range(min_col + margin_cells, max_col - margin_cells, spacing_cells):
+                if (row, col) in self.traversable_cells:
+                    world_pos = self._grid2world(row, col)
+                    waypoints.append(world_pos)
+        
+        if self.verbose:
+            self._log(f"生成 {len(waypoints)} 个路点 (间距={spacing}m)")
+        
+        return waypoints
+    
+    def _find_obstacle_boundary_cells(self) -> Set[Tuple[int, int]]:
+        """找到障碍物边界附近的可通行单元格
+        
+        Returns:
+            障碍物边界附近的可通行单元格集合
+        """
+        boundary_cells = set()
+        
+        # 检查每个可通行单元格是否与不可通行区域相邻
+        for cell in self.traversable_cells:
+            row, col = cell
+            # 检查8邻域
+            for dr in [-1, 0, 1]:
+                for dc in [-1, 0, 1]:
+                    if dr == 0 and dc == 0:
+                        continue
+                    neighbor = (row + dr, col + dc)
+                    # 如果邻居不在可通行区域内，说明当前单元格在边界附近
+                    if neighbor not in self.traversable_cells:
+                        boundary_cells.add(cell)
+                        break
+                else:
+                    continue
+                break
+        
+        return boundary_cells
+    
+    def sample_points_mixed(self, n_total: int, margin: float = 2.0, 
+                            free_ratio: float = 1.0,
+                            max_cost: float = 5.0,
+                            center_ratio: float = 0.3) -> List[np.ndarray]:
+        """在低 cost 的最大连通区域的中心区域采样（自适应道路宽度）
+        
+        策略：
+        1. 找到 trav_cost < max_cost 的区域
+        2. 在这些区域中找到最大连通区域
+        3. 使用距离变换，找到每个点到边界的距离
+        4. 只保留距离 >= 局部道路宽度 * center_ratio 的点（自适应）
+        5. 提取中线并采样
+        
+        Args:
+            n_total: 总采样点数
+            margin: 地图边缘裕量（米）
+            free_ratio: 未使用
+            max_cost: 最大允许的 cost 值，默认 5.0（只选择蓝色区域）
+            center_ratio: 中心区域比例，0.3 表示保留道路中心 40% 的区域
+        
+        Returns:
+            采样点列表（世界坐标）
+        """
+        margin_cells = int(margin / self.resolution)
+        
+        # ========== Step 1: 找到低 cost 的安全区域 ==========
+        safe_cells = set()
+        for cell in self.traversable_cells:
+            row, col = cell
+            if 0 <= row < self.trav_map.shape[0] and 0 <= col < self.trav_map.shape[1]:
+                cost = self.trav_map[row, col]
+                if cost < max_cost:  # 只选择低 cost 区域
+                    safe_cells.add(cell)
+        
+        if self.verbose:
+            self._log(f"低 cost 区域 (cost < {max_cost}): {len(safe_cells)} 个网格")
+        
+        # ========== Step 2: 在安全区域中找到最大连通区域 ==========
+        largest_region = self._find_largest_connected_region(safe_cells)
+        
+        # 保存最大连通区域供可视化使用
+        self.largest_safe_region = largest_region
+        
+        if self.verbose:
+            self._log(f"最大连通区域: {len(largest_region)} 个网格")
+        
+        # ========== Step 3: 使用距离变换找到中心区域（自适应道路宽度） ==========
+        center_region, dist_map = self._find_center_region_adaptive(largest_region, center_ratio)
+        
+        # 保存距离图供可视化使用
+        self.distance_map = dist_map
+        self.center_region = center_region
+        
+        if self.verbose:
+            self._log(f"中心区域 (ratio={center_ratio}): {len(center_region)} 个网格")
+        
+        # 如果中心区域太小，降低比例要求
+        while len(center_region) < n_total * 2 and center_ratio > 0.1:
+            center_ratio -= 0.05
+            center_region, _ = self._find_center_region_adaptive(largest_region, center_ratio)
+            if self.verbose:
+                self._log(f"  降低中心比例到 {center_ratio:.2f}，区域大小: {len(center_region)}")
+        
+        # ========== Step 4: 提取骨架（中线） ==========
+        # 在中心区域上提取骨架
+        skeleton_cells = self._extract_skeleton_simple(center_region)
+        
+        # 保存骨架供可视化使用
+        self.skeleton_cells = skeleton_cells
+        
+        if self.verbose:
+            self._log(f"骨架（中线）: {len(skeleton_cells)} 个点")
+        
+        # ========== Step 4: 过滤掉太靠近地图边缘的单元格 ==========
+        if len(self.traversable_cells) > 0:
+            rows = [c[0] for c in self.traversable_cells]
+            cols = [c[1] for c in self.traversable_cells]
+            min_row, max_row = min(rows), max(rows)
+            min_col, max_col = min(cols), max(cols)
+            
+            skeleton_cells = [c for c in skeleton_cells 
+                              if min_row + margin_cells <= c[0] <= max_row - margin_cells
+                              and min_col + margin_cells <= c[1] <= max_col - margin_cells]
+        
+        sampled_points = []
+        
+        # ========== Step 5: 沿骨架均匀采样 ==========
+        if len(skeleton_cells) > 0:
+            n_actual = min(n_total, len(skeleton_cells))
+            # 均匀间隔采样
+            step = max(1, len(skeleton_cells) // n_actual)
+            sampled_indices = list(range(0, len(skeleton_cells), step))[:n_actual]
+            
+            for idx in sampled_indices:
+                cell = skeleton_cells[idx]
+                world_pos = self._grid2world(cell[0], cell[1])
+                sampled_points.append(world_pos)
+        
+        if self.verbose:
+            self._log(f"沿中线采样完成: {len(sampled_points)} 个点")
+        
+        return sampled_points
+    
+    def _extract_skeleton(self, region: Set[Tuple[int, int]], 
+                          min_obstacle_dist: int = 3) -> List[Tuple[int, int]]:
+        """提取区域的骨架（中线），并确保远离障碍物
+        
+        使用逐行/逐列中点法：
+        - 对于每一行，找到该行所有属于区域的列，取中间列
+        - 过滤掉靠近障碍物（cost >= 50）的点
+        
+        Args:
+            region: 区域的网格单元集合
+            min_obstacle_dist: 到障碍物的最小距离（网格数）
+        
+        Returns:
+            骨架点列表，按行排序，远离障碍物
+        """
+        if not region:
+            return []
+        
+        # 按行分组
+        row_to_cols = {}
+        for (row, col) in region:
+            if row not in row_to_cols:
+                row_to_cols[row] = []
+            row_to_cols[row].append(col)
+        
+        # 对每行取中点
+        skeleton_raw = []
+        for row in sorted(row_to_cols.keys()):
+            cols = sorted(row_to_cols[row])
+            # 取中间位置的列
+            mid_col = cols[len(cols) // 2]
+            skeleton_raw.append((row, mid_col))
+        
+        # 过滤掉靠近障碍物的点
+        skeleton = []
+        for (row, col) in skeleton_raw:
+            if self._is_far_from_obstacles(row, col, min_obstacle_dist):
+                skeleton.append((row, col))
+        
+        if self.verbose and len(skeleton_raw) != len(skeleton):
+            self._log(f"  骨架过滤: {len(skeleton_raw)} -> {len(skeleton)} 点 (移除靠近障碍物的点)")
+        
+        return skeleton
+    
+    def _is_far_from_obstacles(self, row: int, col: int, min_dist: int) -> bool:
+        """检查点是否远离障碍物
+        
+        Args:
+            row, col: 网格坐标
+            min_dist: 最小距离（网格数）
+        
+        Returns:
+            True 如果距离所有障碍物 >= min_dist
+        """
+        # 检查 min_dist 范围内是否有障碍物
+        for dr in range(-min_dist, min_dist + 1):
+            for dc in range(-min_dist, min_dist + 1):
+                # 圆形范围检查
+                if dr * dr + dc * dc > min_dist * min_dist:
+                    continue
+                    
+                nr, nc = row + dr, col + dc
+                
+                # 边界检查
+                if 0 <= nr < self.trav_map.shape[0] and 0 <= nc < self.trav_map.shape[1]:
+                    # 如果邻居是障碍物（cost >= 50）
+                    if self.trav_map[nr, nc] >= 50:
+                        return False
+        
+        return True
+    
+    def _erode_region(self, region: Set[Tuple[int, int]], radius: int) -> Set[Tuple[int, int]]:
+        """对区域进行形态学腐蚀，确保保留的点远离区域边界
+        
+        腐蚀操作会收缩区域，只保留距离边界 >= radius 的点
+        
+        Args:
+            region: 原始区域的网格单元集合
+            radius: 腐蚀半径（网格数）
+        
+        Returns:
+            腐蚀后的区域
+        """
+        if not region or radius <= 0:
+            return region
+        
+        eroded = set()
+        
+        for (row, col) in region:
+            # 检查该点周围是否都在区域内
+            is_interior = True
+            for dr in range(-radius, radius + 1):
+                if not is_interior:
+                    break
+                for dc in range(-radius, radius + 1):
+                    # 圆形范围
+                    if dr * dr + dc * dc > radius * radius:
+                        continue
+                    
+                    nr, nc = row + dr, col + dc
+                    if (nr, nc) not in region:
+                        is_interior = False
+                        break
+            
+            if is_interior:
+                eroded.add((row, col))
+        
+        return eroded
+    
+    def _find_center_region_adaptive(self, region: Set[Tuple[int, int]], 
+                                      center_ratio: float = 0.3) -> Tuple[Set[Tuple[int, int]], np.ndarray]:
+        """使用距离变换找到区域的中心部分（自适应道路宽度）
+        
+        原理：
+        1. 计算每个点到区域边界的距离（距离变换）
+        2. 对于每个点，找到它所在"道路"的局部宽度（用该点的距离 * 2 近似）
+        3. 只保留距离 >= 局部宽度 * center_ratio 的点
+        
+        这样宽路和窄路都能保留中心区域的点
+        
+        Args:
+            region: 原始区域
+            center_ratio: 中心比例，0.3 表示保留距离边界 >= 道路半宽 * 0.3 的点
+        
+        Returns:
+            (中心区域, 距离图)
+        """
+        if not region:
+            return set(), np.array([])
+        
+        # 将 region 转换为二值图像
+        rows = [c[0] for c in region]
+        cols = [c[1] for c in region]
+        min_row, max_row = min(rows), max(rows)
+        min_col, max_col = min(cols), max(cols)
+        
+        height = max_row - min_row + 1
+        width = max_col - min_col + 1
+        
+        # 创建二值图像（1 = 区域内，0 = 区域外）
+        binary = np.zeros((height, width), dtype=np.uint8)
+        for (r, c) in region:
+            binary[r - min_row, c - min_col] = 1
+        
+        # 距离变换：计算每个点到最近边界的距离
+        from scipy import ndimage
+        dist_map = ndimage.distance_transform_edt(binary)
+        
+        # 找到中心区域的点
+        center_region = set()
+        
+        for (r, c) in region:
+            local_r = r - min_row
+            local_c = c - min_col
+            
+            # 该点到边界的距离
+            dist = dist_map[local_r, local_c]
+            
+            # 找到该点所在"道路"的局部最大距离（近似道路半宽）
+            # 使用该点周围的最大距离作为局部道路半宽的估计
+            local_max_dist = self._get_local_max_distance(dist_map, local_r, local_c, search_radius=20)
+            
+            # 如果该点的距离 >= 局部最大距离 * center_ratio，则保留
+            # 这意味着该点在道路的中心 (1 - center_ratio*2) 部分
+            if dist >= local_max_dist * center_ratio:
+                center_region.add((r, c))
+        
+        # 创建完整尺寸的距离图用于可视化
+        full_dist_map = np.zeros_like(self.trav_map, dtype=np.float32)
+        for (r, c) in region:
+            full_dist_map[r, c] = dist_map[r - min_row, c - min_col]
+        
+        return center_region, full_dist_map
+    
+    def _get_local_max_distance(self, dist_map: np.ndarray, row: int, col: int, 
+                                 search_radius: int = 20) -> float:
+        """获取局部区域内的最大距离值（估计局部道路半宽）
+        
+        Args:
+            dist_map: 距离变换图
+            row, col: 当前点坐标（在距离图中的坐标）
+            search_radius: 搜索半径
+        
+        Returns:
+            局部最大距离
+        """
+        h, w = dist_map.shape
+        
+        # 限制搜索范围
+        r_min = max(0, row - search_radius)
+        r_max = min(h, row + search_radius + 1)
+        c_min = max(0, col - search_radius)
+        c_max = min(w, col + search_radius + 1)
+        
+        # 获取局部区域
+        local_region = dist_map[r_min:r_max, c_min:c_max]
+        
+        # 返回局部最大值
+        if local_region.size > 0:
+            return np.max(local_region)
+        return dist_map[row, col]
+    
+    def _extract_skeleton_simple(self, region: Set[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """简单骨架提取：对每行取中点
+        
+        因为区域已经被腐蚀过了，所以不需要再检查障碍物距离
+        
+        Args:
+            region: 区域的网格单元集合
+        
+        Returns:
+            骨架点列表，按行排序
+        """
+        if not region:
+            return []
+        
+        # 按行分组
+        row_to_cols = {}
+        for (row, col) in region:
+            if row not in row_to_cols:
+                row_to_cols[row] = []
+            row_to_cols[row].append(col)
+        
+        # 对每行取中点
+        skeleton = []
+        for row in sorted(row_to_cols.keys()):
+            cols = sorted(row_to_cols[row])
+            # 取中间位置的列
+            mid_col = cols[len(cols) // 2]
+            skeleton.append((row, mid_col))
+        
+        return skeleton
+    
+    def cluster_points_kmeans(self, points: List[np.ndarray], k: int) -> List[np.ndarray]:
+        """使用 k-means 聚类得到 K 个代表性点
+        
+        Args:
+            points: 采样点列表
+            k: 聚类数量（代表点数量）
+        
+        Returns:
+            K 个代表性点（聚类中心最近的可通行点）
+        """
+        if len(points) <= k:
+            return points
+        
+        points_arr = np.array(points)
+        
+        # k-means 聚类
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        kmeans.fit(points_arr)
+        
+        # 找到每个聚类中心最近的实际采样点（确保在可通行区域内）
+        representative_points = []
+        centers = kmeans.cluster_centers_
+        
+        for center in centers:
+            # 找到最近的可通行点
+            min_dist = float('inf')
+            best_point = None
+            
+            for point in points:
+                dist = np.linalg.norm(point - center)
+                if dist < min_dist:
+                    # 检查该点是否在可通行区域
+                    cell = self._world2grid(point)
+                    if cell in self.traversable_cells:
+                        min_dist = dist
+                        best_point = point
+            
+            if best_point is not None:
+                representative_points.append(best_point)
+        
+        if self.verbose:
+            self._log(f"k-means 聚类完成: {len(representative_points)} 个代表点")
+        
+        return representative_points
+    
+    def assign_points_to_trajectories(self, points: List[np.ndarray], 
+                                       s: int,
+                                       interleaved: bool = True) -> List[List[np.ndarray]]:
+        """将代表点分配到 S 条轨迹子集
+        
+        Args:
+            points: 代表点列表
+            s: 轨迹数量
+            interleaved: True = 交错分配（每条轨迹覆盖整个地图）
+                        False = 连续分配（每条轨迹覆盖不同区域）
+        
+        Returns:
+            S 个轨迹子集
+        """
+        n = len(points)
+        if n == 0:
+            return [[] for _ in range(s)]
+        
+        if n <= s:
+            subsets = [[p] for p in points]
+            while len(subsets) < s:
+                subsets.append([])
+            return subsets
+        
+        # 按 x 坐标排序
+        points_sorted = sorted(points, key=lambda p: p[0])
+        
+        subsets = [[] for _ in range(s)]
+        
+        if interleaved:
+            # 交错分配：点 0,s,2s,... 给轨迹0；点 1,s+1,2s+1,... 给轨迹1
+            # 这样每条轨迹的点分布在整个地图
+            for i, point in enumerate(points_sorted):
+                subset_idx = i % s
+                subsets[subset_idx].append(point)
+        else:
+            # 连续分配：每条轨迹覆盖一个区域
+            points_per_subset = n // s
+            remainder = n % s
+            
+            idx = 0
+            for i in range(s):
+                count = points_per_subset + (1 if i < remainder else 0)
+                for _ in range(count):
+                    if idx < n:
+                        subsets[i].append(points_sorted[idx])
+                        idx += 1
+        
+        if self.verbose:
+            sizes = [len(subset) for subset in subsets]
+            mode = "交错" if interleaved else "连续"
+            self._log(f"按{mode}模式分配到 {s} 条轨迹: {sizes}")
+        
+        return subsets
+    
+    def solve_tsp_for_points(self, points: List[np.ndarray], 
+                             start_angle: float = 0.0,
+                             clockwise: bool = True) -> List[np.ndarray]:
+        """按角度顺序排序（顺时针或逆时针）
+        
+        计算每个点相对于中心的角度，按角度排序形成环形路径。
+        
+        Args:
+            points: 点列表
+            start_angle: 起始角度（弧度），不同轨迹可以有不同起始角度
+            clockwise: True=顺时针，False=逆时针
+        
+        Returns:
+            排序后的点列表
+        """
+        if len(points) <= 2:
+            return points
+        
+        points_arr = np.array([[p[0], p[1]] for p in points])
+        
+        # 计算中心点
+        center = points_arr.mean(axis=0)
+        
+        # 计算每个点相对于中心的角度
+        angles = np.arctan2(points_arr[:, 1] - center[1], 
+                           points_arr[:, 0] - center[0])
+        
+        # 调整角度，使其从 start_angle 开始
+        angles = (angles - start_angle) % (2 * np.pi)
+        
+        # 排序：顺时针则角度递减，逆时针则角度递增
+        if clockwise:
+            sorted_indices = np.argsort(-angles)  # 角度递减
+        else:
+            sorted_indices = np.argsort(angles)   # 角度递增
+        
+        sorted_points = [points[i] for i in sorted_indices]
+        return sorted_points
+    
+    def generate_trajectory_from_points(self, points: List[np.ndarray]) -> np.ndarray:
+        """从排序后的代表点生成轨迹（用 A* 连接相邻点）
+        
+        Args:
+            points: 排序后的点列表
+        
+        Returns:
+            完整轨迹 (N, 3)
+        """
+        if len(points) == 0:
+            return np.array([]).reshape(0, 3)
+        
+        if len(points) == 1:
+            height = self._get_height_at(points[0])
+            if height is None:
+                height = 0.0
+            return np.array([[points[0][0], points[0][1], height]])
+        
+        trajectory_parts = []
+        failed_segments = []
+        
+        for i in range(len(points) - 1):
+            start = points[i]
+            end = points[i + 1]
+            
+            # 用 A* 规划路径
+            try:
+                path = self.planner.plan(start, end)
+                if path is not None and len(path) > 0:
+                    # 注意：已禁用穿墙检测，信任 A* + 轨迹优化器
+                    # A* 和优化器已经考虑了 traversability cost，不需要再次检测
+                    # 如果需要重新启用，取消下面的注释：
+                    # is_valid, invalid_ratio = self._check_path_validity(path, max_invalid_ratio=0.05)
+                    # if not is_valid:
+                    #     failed_segments.append((i, i+1))
+                    #     if self.verbose:
+                    #         self._log(f"  警告: 路径段 {i}->{i+1} 穿过障碍区域 ({invalid_ratio*100:.1f}% 无效)，跳过")
+                    #     continue
+                    
+                    # 过滤无效点（处理边界情况）
+                    filtered_path = self._filter_trajectory(path)
+                    if len(filtered_path) > 0:
+                        trajectory_parts.append(filtered_path)
+                    else:
+                        # 过滤后为空，跳过此段
+                        failed_segments.append((i, i+1))
+                        if self.verbose:
+                            self._log(f"  警告: 路径段 {i}->{i+1} 过滤后为空，跳过")
+                else:
+                    # A* 规划失败，跳过此段（不再使用直线插值穿过障碍物）
+                    failed_segments.append((i, i+1))
+                    if self.verbose:
+                        self._log(f"  警告: A* 规划失败 {i}->{i+1}，跳过（不穿过障碍物）")
+            except Exception as e:
+                # 规划异常，跳过此段
+                failed_segments.append((i, i+1))
+                if self.verbose:
+                    self._log(f"  警告: 规划异常 {i}->{i+1}: {e}，跳过")
+        
+        if failed_segments and self.verbose:
+            self._log(f"  总计跳过 {len(failed_segments)} 个无法规划的路径段")
+        
+        if not trajectory_parts:
+            return np.array([]).reshape(0, 3)
+        
+        full_trajectory = np.vstack(trajectory_parts)
+        return self._filter_trajectory(full_trajectory)
+    
+    def smooth_trajectory_bspline(self, trajectory: np.ndarray, 
+                                   smoothing_factor: float = 0.0,
+                                   num_points: int = None,
+                                   downsample_factor: int = 5) -> np.ndarray:
+        """使用 B 样条对轨迹进行平滑
+        
+        Args:
+            trajectory: 原始轨迹 (N, 3)
+            smoothing_factor: 平滑因子，0 表示插值（通过所有点），
+                            大于 0 表示近似（更平滑但可能不通过原点）
+            num_points: 输出轨迹点数，None 表示与原始相同
+            downsample_factor: 降采样因子，先每隔 N 个点取一个，再平滑
+        
+        Returns:
+            平滑后的轨迹 (M, 3)
+        """
+        if len(trajectory) < 4:
+            # B 样条需要至少 4 个点
+            return trajectory
+        
+        if num_points is None:
+            num_points = len(trajectory)
+        
+        try:
+            # Step 1: 降采样 - 减少点的数量，让拐角更容易被平滑掉
+            if downsample_factor > 1 and len(trajectory) > downsample_factor * 4:
+                # 保留首尾点，中间均匀采样
+                indices = list(range(0, len(trajectory), downsample_factor))
+                if indices[-1] != len(trajectory) - 1:
+                    indices.append(len(trajectory) - 1)
+                trajectory_ds = trajectory[indices]
+            else:
+                trajectory_ds = trajectory
+            
+            # 提取 x, y, z 坐标
+            x = trajectory_ds[:, 0]
+            y = trajectory_ds[:, 1]
+            z = trajectory_ds[:, 2]
+            
+            # 移除重复点（B 样条不允许重复点）
+            unique_mask = np.ones(len(trajectory_ds), dtype=bool)
+            for i in range(1, len(trajectory_ds)):
+                if np.allclose(trajectory_ds[i, :2], trajectory_ds[i-1, :2], atol=0.01):
+                    unique_mask[i] = False
+            
+            x = x[unique_mask]
+            y = y[unique_mask]
+            z = z[unique_mask]
+            
+            if len(x) < 4:
+                return trajectory
+            
+            # Step 2: 计算 B 样条参数
+            # k=3 表示三次 B 样条
+            # smoothing_factor > 0 表示近似（不严格通过每个点，更平滑）
+            tck, u = splprep([x, y, z], s=smoothing_factor, k=3)
+            
+            # Step 3: 生成平滑后的轨迹点
+            u_new = np.linspace(0, 1, num_points)
+            x_new, y_new, z_new = splev(u_new, tck)
+            
+            smooth_trajectory = np.column_stack([x_new, y_new, z_new])
+            
+            # Step 4: 修正高度
+            for i in range(len(smooth_trajectory)):
+                height = self._get_height_at(smooth_trajectory[i, :2])
+                if height is not None:
+                    smooth_trajectory[i, 2] = height
+            
+            # 直接返回平滑后的轨迹，不做穿墙检测
+            # （采样点已经在安全区域，A* 路径应该是安全的）
+            return smooth_trajectory
+            
+        except Exception as e:
+            if self.verbose:
+                self._log(f"B 样条平滑失败: {e}，返回原始轨迹")
+            return trajectory
+    
+    def run_sparse_trajectories(self, n_samples: int = 100, 
+                                 k_clusters: int = 30,
+                                 s_trajectories: int = 3,
+                                 smooth: bool = True,
+                                 smooth_factor: float = 0.0,
+                                 interleaved: bool = True) -> List[np.ndarray]:
+        """论文方法：生成 S 条稀疏轨迹覆盖环境
+        
+        Args:
+            n_samples: 总采样点数
+            k_clusters: k-means 聚类数（代表点数量）
+            s_trajectories: 生成的轨迹数量
+            smooth: 是否对轨迹进行 B 样条平滑
+            smooth_factor: 平滑因子，0 表示插值，>0 表示近似（更平滑）
+            interleaved: True = 交错分配（每条轨迹覆盖整个地图，适合高覆盖率）
+                        False = 连续分配（每条轨迹覆盖不同区域）
+        
+        Returns:
+            S 条轨迹的列表，每条轨迹是 (N, 3) 数组
+        """
+        self._log("=" * 60)
+        self._log("稀疏轨迹采样 - 开始（论文方法）")
+        self._log("=" * 60)
+        self._log(f"参数: n_samples={n_samples}, k_clusters={k_clusters}, s_trajectories={s_trajectories}")
+        self._log(f"分配模式: {'交错（全图覆盖）' if interleaved else '连续（区域划分）'}")
+        self._log(f"平滑: {'开启 (B-spline, s=' + str(smooth_factor) + ')' if smooth else '关闭'}")
+        
+        # Step 1: 混合采样
+        self._log("\n>>> Step 1: 混合采样 (自由空间 + 障碍物附近)")
+        sampled_points = self.sample_points_mixed(n_samples)
+        
+        if len(sampled_points) < s_trajectories:
+            self._log("错误: 采样点不足!")
+            return []
+        
+        # Step 2: k-means 聚类得到代表点
+        self._log("\n>>> Step 2: k-means 聚类得到代表点")
+        k_actual = min(k_clusters, len(sampled_points))
+        representative_points = self.cluster_points_kmeans(sampled_points, k_actual)
+        
+        if len(representative_points) < s_trajectories:
+            self._log("错误: 代表点不足!")
+            return []
+        
+        # Step 3: 分配到 S 个子集
+        mode_str = "交错（全图）" if interleaved else "连续（分区）"
+        self._log(f"\n>>> Step 3: {mode_str}分配到 S 条轨迹子集")
+        subsets = self.assign_points_to_trajectories(representative_points, s_trajectories, interleaved=interleaved)
+        
+        # Step 4 & 5: 扫描排序 + A* 路径规划
+        self._log("\n>>> Step 4 & 5: 扫描排序 + A* 路径规划")
+        trajectories = []
+        
+        for i, subset in enumerate(subsets):
+            if len(subset) < 2:
+                self._log(f"  轨迹 {i+1}: 点数不足 ({len(subset)}), 跳过")
+                continue
+            
+            # 按角度排序，每条轨迹从不同起始角度开始（均匀分布）
+            start_angle = (2 * np.pi * i) / s_trajectories
+            sorted_points = self.solve_tsp_for_points(subset, start_angle=start_angle, clockwise=True)
+            
+            # 生成轨迹
+            traj = self.generate_trajectory_from_points(sorted_points)
+            
+            if len(traj) > 0:
+                trajectories.append(traj)
+                self._log(f"  轨迹 {i+1}: {len(subset)} 个代表点 -> {len(traj)} 个轨迹点")
+            else:
+                self._log(f"  轨迹 {i+1}: 生成失败")
+        
+        # Step 6: B 样条平滑
+        if smooth and trajectories:
+            self._log("\n>>> Step 6: B 样条轨迹平滑")
+            smoothed_trajectories = []
+            for i, traj in enumerate(trajectories):
+                smoothed = self.smooth_trajectory_bspline(traj, smoothing_factor=smooth_factor)
+                smoothed_trajectories.append(smoothed)
+                self._log(f"  轨迹 {i+1}: {len(traj)} -> {len(smoothed)} 点 (平滑后)")
+            trajectories = smoothed_trajectories
+        
+        # 计算覆盖率
+        all_covered = set()
+        for traj in trajectories:
+            covered = self._compute_path_coverage(traj)
+            all_covered |= covered
+        
+        coverage_rate = len(all_covered) / len(self.traversable_cells) * 100 if self.traversable_cells else 0
+        
+        self._log("\n" + "=" * 60)
+        self._log(f"完成! 生成 {len(trajectories)} 条轨迹, 覆盖率: {coverage_rate:.1f}%")
+        total_points = sum(len(t) for t in trajectories)
+        self._log(f"总轨迹点数: {total_points}")
+        self._log("=" * 60)
+        
+        return trajectories
+    
+    def generate_start_end_pairs_nearest(self, waypoints: List[np.ndarray], 
+                                          k: int = 3) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """生成起点终点对：每个点连接到最近的k个点
+        
+        Args:
+            waypoints: 路点列表
+            k: 每个点连接的邻居数
+        
+        Returns:
+            起点终点对列表
+        """
+        pairs = []
+        n = len(waypoints)
+        
+        if n < 2:
+            return pairs
+        
+        k = min(k, n - 1)
+        waypoints_arr = np.array(waypoints)
+        dist_matrix = cdist(waypoints_arr, waypoints_arr)
+        
+        for i in range(n):
+            nearest_indices = np.argsort(dist_matrix[i])[1:k+1]  # 排除自己
+            for j in nearest_indices:
+                if i < j:  # 避免重复
+                    pairs.append((waypoints[i], waypoints[j]))
+        
+        if self.verbose:
+            self._log(f"生成 {len(pairs)} 个起点终点对 (nearest k={k})")
+        
+        return pairs
+    
+    def generate_start_end_pairs_sweep(self, waypoints: List[np.ndarray], 
+                                        direction: str = 'horizontal') \
+                                        -> List[Tuple[np.ndarray, np.ndarray]]:
+        """生成起点终点对：扫描式连接（类似割草机模式）
+        
+        Args:
+            waypoints: 路点列表
+            direction: 扫描方向 'horizontal' 或 'vertical'
+        
+        Returns:
+            起点终点对列表
+        """
+        pairs = []
+        
+        if len(waypoints) < 2:
+            return pairs
+        
+        waypoints_arr = np.array(waypoints)
+        
+        if direction == 'horizontal':
+            # 按y坐标分组，每组内按x坐标排序
+            y_coords = waypoints_arr[:, 1]
+            unique_y = np.unique(np.round(y_coords / (self.resolution * 5)) * (self.resolution * 5))
+            
+            for y in unique_y:
+                mask = np.abs(waypoints_arr[:, 1] - y) < self.resolution * 3
+                group_indices = np.where(mask)[0]
+                if len(group_indices) >= 2:
+                    # 按x坐标排序
+                    sorted_indices = group_indices[np.argsort(waypoints_arr[group_indices, 0])]
+                    # 连接首尾
+                    pairs.append((waypoints[sorted_indices[0]], waypoints[sorted_indices[-1]]))
+        else:
+            # 按x坐标分组，每组内按y坐标排序
+            x_coords = waypoints_arr[:, 0]
+            unique_x = np.unique(np.round(x_coords / (self.resolution * 5)) * (self.resolution * 5))
+            
+            for x in unique_x:
+                mask = np.abs(waypoints_arr[:, 0] - x) < self.resolution * 3
+                group_indices = np.where(mask)[0]
+                if len(group_indices) >= 2:
+                    sorted_indices = group_indices[np.argsort(waypoints_arr[group_indices, 1])]
+                    pairs.append((waypoints[sorted_indices[0]], waypoints[sorted_indices[-1]]))
+        
+        if self.verbose:
+            self._log(f"生成 {len(pairs)} 个起点终点对 (sweep {direction})")
+        
+        return pairs
+    
+    def plan_single_path(self, start_pos: np.ndarray, end_pos: np.ndarray, 
+                         path_id: int) -> Optional[PathInfo]:
+        """规划单条路径
+        
+        Args:
+            start_pos: 起点（世界坐标，2D）
+            end_pos: 终点（世界坐标，2D）
+            path_id: 路径ID
+        
+        Returns:
+            PathInfo 或 None（规划失败时）
+        """
+        start = np.asarray(start_pos, dtype=np.float32)
+        end = np.asarray(end_pos, dtype=np.float32)
+        
+        try:
+            trajectory = self.planner.plan(start, end)
+        except Exception as e:
+            if self.verbose:
+                self._log(f"Path {path_id} 规划异常: {e}")
+            return None
+        
+        if trajectory is None or len(trajectory) == 0:
+            if self.verbose:
+                self._log(f"Path {path_id} 规划失败: {start} -> {end}")
+            return None
+        
+        covered_cells = self._compute_path_coverage(trajectory)
+        
+        path_info = PathInfo(
+            path_id=path_id,
+            start_pos=start,
+            end_pos=end,
+            trajectory=trajectory,
+            covered_cells=covered_cells
+        )
+        
+        if self.verbose:
+            self._log(f"Path {path_id}: 成功, 轨迹点={len(trajectory)}, 覆盖网格={len(covered_cells)}")
+        
+        return path_info
+    
+    def generate_candidate_paths(self, 
+                                  start_end_pairs: List[Tuple[np.ndarray, np.ndarray]]) \
+                                  -> List[PathInfo]:
+        """生成所有候选路径
+        
+        Args:
+            start_end_pairs: 起点终点对列表 [(start1, end1), ...]
+        
+        Returns:
+            成功规划的路径列表
+        """
+        self.candidate_paths = []
+        
+        total = len(start_end_pairs)
+        success = 0
+        
+        for i, (start, end) in enumerate(start_end_pairs):
+            if self.verbose and (i + 1) % 10 == 0:
+                self._log(f"规划进度: {i+1}/{total}")
+            
+            path_info = self.plan_single_path(start, end, path_id=i)
+            if path_info is not None:
+                self.candidate_paths.append(path_info)
+                success += 1
+        
+        self._log(f"候选路径生成完成: 成功 {success}/{total}")
+        
+        return self.candidate_paths
+    
+    def solve_set_cover_greedy(self, 
+                                target_coverage: float = 0.7,
+                                min_new_coverage_ratio: float = 0.3,
+                                max_paths: int = 15) -> List[PathInfo]:
+        """贪心算法求解集合覆盖问题（优化版：避免重叠、不追求完全覆盖）
+        
+        Args:
+            target_coverage: 目标覆盖率（0-1），达到后停止选择新路径
+            min_new_coverage_ratio: 最小新覆盖比例，路径必须有至少这么多比例是新覆盖的才会被选中
+            max_paths: 最大路径数量限制
+        
+        Returns:
+            选中的路径列表
+        """
+        if not self.candidate_paths:
+            self._log("错误: 没有候选路径!")
+            return []
+        
+        uncovered = self.traversable_cells.copy()
+        self.selected_paths = []
+        remaining_paths = self.candidate_paths.copy()
+        
+        total_to_cover = len(uncovered)
+        target_uncovered = int(total_to_cover * (1 - target_coverage))
+        
+        self._log(f"开始集合覆盖求解:")
+        self._log(f"  - 总网格数: {total_to_cover}")
+        self._log(f"  - 目标覆盖率: {target_coverage*100:.0f}%")
+        self._log(f"  - 最大路径数: {max_paths}")
+        
+        iteration = 0
+        while remaining_paths and len(self.selected_paths) < max_paths:
+            iteration += 1
+            
+            # 找到最佳路径：覆盖最多新区域，且重叠比例低
+            best_path = None
+            best_score = 0
+            best_newly_covered = set()
+            
+            for path in remaining_paths:
+                newly_covered = path.covered_cells & uncovered
+                total_coverage = len(path.covered_cells)
+                new_coverage = len(newly_covered)
+                
+                if total_coverage == 0:
+                    continue
+                
+                # 新覆盖比例 = 新覆盖数 / 路径总覆盖数
+                new_ratio = new_coverage / total_coverage
+                
+                # 如果新覆盖比例太低（说明与已选路径重叠太多），跳过
+                if new_ratio < min_new_coverage_ratio:
+                    continue
+                
+                # 得分 = 新覆盖数量（优先选覆盖新区域多的）
+                score = new_coverage
+                
+                if score > best_score:
+                    best_score = score
+                    best_path = path
+                    best_newly_covered = newly_covered
+            
+            if best_path is None:
+                self._log(f"无法找到满足条件的路径，停止选择")
+                break
+            
+            # 选择该路径
+            self.selected_paths.append(best_path)
+            uncovered -= best_newly_covered
+            remaining_paths.remove(best_path)
+            
+            coverage_pct = (1 - len(uncovered) / total_to_cover) * 100
+            if self.verbose:
+                self._log(f"迭代 {iteration}: 选择 Path {best_path.path_id}, "
+                         f"新覆盖 {len(best_newly_covered)} 网格, 总覆盖率 {coverage_pct:.1f}%")
+            
+            # 检查是否达到目标覆盖率
+            if len(uncovered) <= target_uncovered:
+                self._log(f"达到目标覆盖率，停止选择")
+                break
+        
+        final_coverage = (1 - len(uncovered) / total_to_cover) * 100
+        self._log(f"集合覆盖完成: 选择 {len(self.selected_paths)} 条路径, "
+                 f"覆盖率 {final_coverage:.1f}%")
+        
+        return self.selected_paths
+    
+    def connect_paths_tsp(self, paths: Optional[List[PathInfo]] = None) -> List[PathInfo]:
+        """使用贪心TSP确定路径执行顺序，最小化连接距离
+        
+        Args:
+            paths: 要排序的路径列表，默认使用选中的路径
+        
+        Returns:
+            排序后的路径列表
+        """
+        if paths is None:
+            paths = self.selected_paths
+        
+        if len(paths) <= 1:
+            return paths
+        
+        n = len(paths)
+        
+        # 计算路径间的距离矩阵
+        endpoints = np.array([p.trajectory[-1, :2] for p in paths])
+        startpoints = np.array([p.trajectory[0, :2] for p in paths])
+        
+        # dist[i][j] = 路径i的终点 到 路径j的起点 的距离
+        dist_matrix = cdist(endpoints, startpoints)
+        
+        # 贪心TSP
+        visited = [False] * n
+        order = [0]
+        visited[0] = True
+        
+        for _ in range(n - 1):
+            current = order[-1]
+            best_next = -1
+            best_dist = float('inf')
+            
+            for j in range(n):
+                if not visited[j] and dist_matrix[current, j] < best_dist:
+                    best_dist = dist_matrix[current, j]
+                    best_next = j
+            
+            if best_next >= 0:
+                order.append(best_next)
+                visited[best_next] = True
+        
+        sorted_paths = [paths[i] for i in order]
+        
+        # 计算总连接距离
+        total_dist = sum(
+            np.linalg.norm(sorted_paths[i].trajectory[-1, :2] - sorted_paths[i+1].trajectory[0, :2])
+            for i in range(len(sorted_paths) - 1)
+        )
+        
+        self._log(f"TSP排序完成: 路径连接总距离 {total_dist:.2f} m")
+        
+        return sorted_paths
+    
+    def generate_full_trajectory(self, sorted_paths: List[PathInfo], 
+                                  plan_connections: bool = True) -> np.ndarray:
+        """将排序后的路径连接成完整轨迹
+        
+        Args:
+            sorted_paths: 排序后的路径列表
+            plan_connections: 是否规划路径间的连接段
+        
+        Returns:
+            完整轨迹 (N, 3)
+        """
+        if not sorted_paths:
+            return np.array([]).reshape(0, 3)
+        
+        trajectory_parts = []
+        
+        for i, path in enumerate(sorted_paths):
+            # 过滤当前路径中的无效点
+            filtered_path = self._filter_trajectory(path.trajectory)
+            if len(filtered_path) > 0:
+                trajectory_parts.append(filtered_path)
+            
+            # 添加连接段（如果不是最后一条路径）
+            if i < len(sorted_paths) - 1:
+                next_path = sorted_paths[i + 1]
+                
+                # 使用过滤后路径的端点
+                if len(trajectory_parts) > 0 and len(trajectory_parts[-1]) > 0:
+                    current_end = trajectory_parts[-1][-1, :2]
+                else:
+                    current_end = path.trajectory[-1, :2]
+                
+                next_start = next_path.trajectory[0, :2]
+                
+                # 计算两点距离
+                dist = np.linalg.norm(next_start - current_end)
+                connection = np.array([]).reshape(0, 3)
+                
+                if dist < 0.5:  # 距离很近，可以直接连接
+                    connection = self._interpolate_connection(current_end, next_start)
+                elif plan_connections:
+                    # 用 A* 规划连接路径
+                    try:
+                        planned = self.planner.plan(current_end, next_start)
+                        if planned is not None and len(planned) > 0:
+                            # 过滤规划得到的连接路径
+                            connection = self._filter_trajectory(planned)
+                        else:
+                            # A* 规划失败，跳过此连接（不穿过障碍物）
+                            if self.verbose:
+                                self._log(f"  连接段规划失败，跳过（不穿过障碍物）")
+                    except:
+                        # 规划异常，跳过此连接
+                        if self.verbose:
+                            self._log(f"  连接段规划异常，跳过")
+                # 如果不规划连接，也跳过（不用直线插值）
+                
+                # 只添加非空的连接段
+                if len(connection) > 0:
+                    trajectory_parts.append(connection)
+        
+        if not trajectory_parts:
+            return np.array([]).reshape(0, 3)
+        
+        full_trajectory = np.vstack(trajectory_parts)
+        
+        # 最终过滤：确保所有点都有效
+        full_trajectory = self._filter_trajectory(full_trajectory)
+        
+        self._log(f"完整轨迹生成: {len(full_trajectory)} 个点 (已过滤无效点)")
+        
+        return full_trajectory
+    
+    def _interpolate_connection(self, start: np.ndarray, end: np.ndarray, 
+                                 step: float = 0.5) -> np.ndarray:
+        """简单直线插值连接（带边界检查）
+        
+        Args:
+            start: 起点 [x, y]
+            end: 终点 [x, y]
+            step: 插值步长（米）
+        
+        Returns:
+            插值轨迹 (N, 3)，只包含在可通行区域内且高度有效的点
+        """
+        dist = np.linalg.norm(end - start)
+        n_points = max(int(dist / step), 2)
+        
+        t = np.linspace(0, 1, n_points).reshape(-1, 1)
+        
+        xy = start + t * (end - start)
+        
+        # 过滤掉不在可通行区域内的点
+        valid_points = []
+        for point in xy:
+            cell = self._world2grid(point)
+            if cell in self.traversable_cells:
+                # 获取该位置的高度（从 tomogram）
+                height = self._get_height_at(point)
+                if height is not None:  # 只添加高度有效的点
+                    valid_points.append([point[0], point[1], height])
+        
+        if len(valid_points) == 0:
+            # 如果直线完全不可通行，返回空数组（不要返回无效点）
+            return np.array([]).reshape(0, 3)
+        
+        return np.array(valid_points)
+    
+    def _get_height_at(self, pos: np.ndarray) -> float:
+        """获取指定位置的高度
+        
+        Args:
+            pos: [x, y] 世界坐标
+        
+        Returns:
+            高度值，如果无法获取（无点云数据）则返回 None
+        """
+        try:
+            cell = self._world2grid(pos)
+            row, col = cell
+            if 0 <= row < self.height_map_raw.shape[0] and 0 <= col < self.height_map_raw.shape[1]:
+                # 检查原始高度是否为 NaN（无点云数据）
+                raw_height = self.height_map_raw[row, col]
+                if np.isnan(raw_height):
+                    return None  # 无点云数据
+                if -10 < raw_height < 100:  # 合理的高度范围
+                    return float(raw_height)
+        except:
+            pass
+        return None
+    
+    def _is_valid_point(self, point: np.ndarray) -> bool:
+        """检查点是否有效（在边界内且高度合理）
+        
+        Args:
+            point: [x, y, z] 世界坐标
+        
+        Returns:
+            是否有效
+        """
+        cell = self._world2grid(point[:2])
+        
+        # 检查是否在可通行区域（室外连通区域）
+        if cell not in self.traversable_cells:
+            return False
+        
+        # 检查高度是否合理
+        if point[2] < -10 or point[2] > 100:
+            return False
+        
+        return True
+    
+    def _check_path_validity(self, path: np.ndarray, 
+                             max_invalid_ratio: float = 0.1,
+                             check_interval: int = 1) -> Tuple[bool, float]:
+        """检查路径是否有效（不穿过室内区域）
+        
+        Args:
+            path: 路径 (N, 3)
+            max_invalid_ratio: 最大允许的无效点比例，超过则认为路径穿墙
+            check_interval: 检查间隔，每隔几个点检查一次（加速检查）
+        
+        Returns:
+            (是否有效, 无效点比例)
+        """
+        if len(path) == 0:
+            return False, 1.0
+        
+        invalid_count = 0
+        total_checked = 0
+        
+        for i in range(0, len(path), check_interval):
+            point = path[i]
+            cell = self._world2grid(point[:2])
+            total_checked += 1
+            
+            if cell not in self.traversable_cells:
+                invalid_count += 1
+        
+        invalid_ratio = invalid_count / total_checked if total_checked > 0 else 0
+        is_valid = invalid_ratio <= max_invalid_ratio
+        
+        return is_valid, invalid_ratio
+    
+    def _filter_trajectory(self, trajectory: np.ndarray) -> np.ndarray:
+        """过滤轨迹，移除无效点（超出边界或地下的点）
+        
+        Args:
+            trajectory: 原始轨迹 (N, 3)
+        
+        Returns:
+            过滤后的轨迹
+        """
+        if len(trajectory) == 0:
+            return trajectory
+        
+        valid_points = []
+        last_valid = None
+        
+        for point in trajectory:
+            if self._is_valid_point(point):
+                valid_points.append(point)
+                last_valid = point
+            else:
+                # 尝试修正高度
+                height = self._get_height_at(point[:2])
+                if height is not None:
+                    corrected = np.array([point[0], point[1], height])
+                    if self._is_valid_point(corrected):
+                        valid_points.append(corrected)
+                        last_valid = corrected
+        
+        if len(valid_points) == 0:
+            self._log("警告: 过滤后轨迹为空!")
+            return np.array([]).reshape(0, 3)
+        
+        return np.array(valid_points)
+    
+    def run(self, start_end_pairs: List[Tuple[np.ndarray, np.ndarray]], 
+            plan_connections: bool = True,
+            target_coverage: float = 0.7,
+            min_new_coverage_ratio: float = 0.3,
+            max_paths: int = 15) -> Tuple[np.ndarray, List[PathInfo], float]:
+        """运行完整的覆盖路径规划流程
+        
+        Args:
+            start_end_pairs: 起点终点对列表
+            plan_connections: 是否规划路径间连接
+            target_coverage: 目标覆盖率（0-1）
+            min_new_coverage_ratio: 新路径必须有至少这个比例的新覆盖区域
+            max_paths: 最大路径数量
+        
+        Returns:
+            (完整轨迹, 选中的路径列表, 覆盖率)
+        """
+        self._log("=" * 60)
+        self._log("覆盖路径规划 - 开始")
+        self._log("=" * 60)
+        
+        # Step 1: 生成候选路径
+        self._log("\n>>> Step 1: 生成候选路径")
+        self.generate_candidate_paths(start_end_pairs)
+        
+        if not self.candidate_paths:
+            self._log("错误: 没有成功规划的候选路径")
+            return np.array([]).reshape(0, 3), [], 0.0
+        
+        # Step 2: 求解覆盖集（不追求完全覆盖，避免重叠）
+        self._log("\n>>> Step 2: 求解覆盖集")
+        selected_paths = self.solve_set_cover_greedy(
+            target_coverage=target_coverage,
+            min_new_coverage_ratio=min_new_coverage_ratio,
+            max_paths=max_paths
+        )
+        
+        if not selected_paths:
+            self._log("错误: 集合覆盖求解失败")
+            return np.array([]).reshape(0, 3), [], 0.0
+        
+        # Step 3: TSP排序
+        self._log("\n>>> Step 3: TSP路径排序")
+        sorted_paths = self.connect_paths_tsp(selected_paths)
+        
+        # Step 4: 生成完整轨迹
+        self._log("\n>>> Step 4: 生成完整轨迹")
+        full_trajectory = self.generate_full_trajectory(sorted_paths, plan_connections)
+        
+        # 计算最终覆盖率
+        all_covered = set()
+        for p in selected_paths:
+            all_covered |= p.covered_cells
+        coverage_rate = len(all_covered) / len(self.traversable_cells) * 100
+        
+        self._log("\n" + "=" * 60)
+        self._log(f"完成! 轨迹点数: {len(full_trajectory)}, 选中路径数: {len(selected_paths)}, "
+                 f"覆盖率: {coverage_rate:.1f}%")
+        self._log("=" * 60)
+        
+        return full_trajectory, sorted_paths, coverage_rate
+    
+    def run_auto(self, waypoint_spacing: float = 10.0, 
+                  connection_mode: str = 'mixed',
+                  plan_connections: bool = True,
+                  target_coverage: float = 0.85,
+                  min_new_coverage_ratio: float = 0.2,
+                  max_paths: int = 20) -> Tuple[np.ndarray, List[PathInfo], float]:
+        """自动生成路点并运行覆盖路径规划
+        
+        Args:
+            waypoint_spacing: 路点间距（米）
+            connection_mode: 连接模式 'nearest', 'sweep_h', 'sweep_v', 'mixed'
+            plan_connections: 是否规划路径间连接
+            target_coverage: 目标覆盖率（0-1），达到后停止
+            min_new_coverage_ratio: 新路径必须有至少这个比例的新覆盖区域（避免重叠）
+            max_paths: 最大路径数量
+        
+        Returns:
+            (完整轨迹, 选中的路径列表, 覆盖率)
+        """
+        self._log(f"自动模式: 路点间距={waypoint_spacing}m, 连接模式={connection_mode}")
+        self._log(f"  目标覆盖率: {target_coverage*100:.0f}%, 最大路径数: {max_paths}")
+        
+        # 生成路点
+        waypoints = self.generate_waypoints_grid(spacing=waypoint_spacing)
+        
+        if len(waypoints) < 2:
+            self._log("错误: 路点数量不足")
+            return np.array([]).reshape(0, 3), [], 0.0
+        
+        # 生成起点终点对
+        if connection_mode == 'nearest':
+            pairs = self.generate_start_end_pairs_nearest(waypoints, k=3)
+        elif connection_mode == 'sweep_h':
+            pairs = self.generate_start_end_pairs_sweep(waypoints, direction='horizontal')
+        elif connection_mode == 'sweep_v':
+            pairs = self.generate_start_end_pairs_sweep(waypoints, direction='vertical')
+        elif connection_mode == 'mixed':
+            pairs = self.generate_start_end_pairs_nearest(waypoints, k=2)
+            pairs += self.generate_start_end_pairs_sweep(waypoints, direction='horizontal')
+            pairs += self.generate_start_end_pairs_sweep(waypoints, direction='vertical')
+        else:
+            pairs = self.generate_start_end_pairs_nearest(waypoints, k=3)
+        
+        return self.run(pairs, plan_connections, target_coverage, min_new_coverage_ratio, max_paths)
+    
+    def get_coverage_map(self) -> np.ndarray:
+        """获取覆盖情况的可视化地图
+        
+        Returns:
+            覆盖地图 (H, W), 值含义:
+            - 0: 不可通行
+            - 1: 可通行但未覆盖
+            - 2: 已覆盖
+        """
+        coverage_map = np.zeros_like(self.trav_map, dtype=np.int32)
+        
+        # 标记可通行区域
+        for cell in self.traversable_cells:
+            coverage_map[cell[0], cell[1]] = 1
+        
+        # 标记已覆盖区域
+        for path in self.selected_paths:
+            for cell in path.covered_cells:
+                if 0 <= cell[0] < coverage_map.shape[0] and 0 <= cell[1] < coverage_map.shape[1]:
+                    coverage_map[cell[0], cell[1]] = 2
+        
+        return coverage_map
+
+
+# ==================== 便捷函数 ====================
+
+def create_coverage_planner(scene: str = 'Plaza', 
+                            coverage_radius: float = 2.0,
+                            traversable_threshold: float = 50.0) -> CoveragePathPlanner:
+    """创建覆盖路径规划器的便捷函数
+    
+    Args:
+        scene: 场景名称 'Spiral', 'Building', 'Plaza'
+        coverage_radius: 覆盖半径（米）
+        traversable_threshold: 可通行阈值
+    
+    Returns:
+        CoveragePathPlanner 实例
+    """
+    cfg = Config()
+    
+    scene_map = {
+        'Spiral': 'spiral0.3_2',
+        'Building': 'AI_vol5_02_all',
+        'Plaza': 'OldTown_all_new1'
+    }
+    
+    tomo_file = scene_map.get(scene, 'OldTown_all_new1')
+    
+    return CoveragePathPlanner(
+        cfg, tomo_file,
+        coverage_radius=coverage_radius,
+        traversable_threshold=traversable_threshold
+    )
+
+
+# ==================== 主函数 ====================
+
+if __name__ == '__main__':
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='覆盖路径规划器')
+    parser.add_argument('--scene', type=str, default='Spiral', 
+                        help='场景名称: Spiral, Building, Plaza')
+    parser.add_argument('--coverage_radius', type=float, default=3.0,
+                        help='覆盖半径（米），越大需要的路径越少')
+    parser.add_argument('--waypoint_spacing', type=float, default=10.0,
+                        help='路点间距（米），越大候选路径越少')
+    parser.add_argument('--connection_mode', type=str, default='mixed',
+                        choices=['nearest', 'sweep_h', 'sweep_v', 'mixed'],
+                        help='起点终点连接模式')
+    parser.add_argument('--output', type=str, default=None,
+                        help='输出文件路径')
+    args = parser.parse_args()
+    
+    # 创建规划器
+    planner = create_coverage_planner(
+        scene=args.scene,
+        coverage_radius=args.coverage_radius
+    )
+    
+    # 运行自动覆盖规划
+    trajectory, selected_paths, coverage_rate = planner.run_auto(
+        waypoint_spacing=args.waypoint_spacing,
+        connection_mode=args.connection_mode
+    )
+    
+    # 输出结果
+    print(f"\n========== 结果汇总 ==========")
+    print(f"场景: {args.scene}")
+    print(f"选中路径数: {len(selected_paths)}")
+    print(f"选中路径ID: {[p.path_id for p in selected_paths]}")
+    print(f"完整轨迹点数: {len(trajectory)}")
+    print(f"覆盖率: {coverage_rate:.1f}%")
+    
+    # 保存结果
+    if args.output:
+        output_file = args.output
+    else:
+        output_file = f'/tmp/coverage_result_{args.scene}.pickle'
+    
+    result = {
+        'trajectory': trajectory,
+        'selected_paths': [
+            {
+                'path_id': p.path_id,
+                'start_pos': p.start_pos,
+                'end_pos': p.end_pos,
+                'trajectory': p.trajectory,
+                'n_covered_cells': len(p.covered_cells)
+            }
+            for p in selected_paths
+        ],
+        'coverage_rate': coverage_rate,
+        'params': {
+            'scene': args.scene,
+            'coverage_radius': args.coverage_radius,
+            'waypoint_spacing': args.waypoint_spacing,
+            'connection_mode': args.connection_mode
+        }
+    }
+    
+    with open(output_file, 'wb') as f:
+        pickle.dump(result, f)
+    print(f"\n结果已保存到: {output_file}")
+

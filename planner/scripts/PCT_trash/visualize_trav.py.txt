@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""
+可视化 traversability map、最大连通区域、自适应中心区域和采样点
+"""
+import os
+import sys
+import numpy as np
+import matplotlib.pyplot as plt
+
+sys.path.append('../')
+from coverage_planner import create_coverage_planner
+
+def visualize_traversability(scene='Plaza', max_cost=5.0, center_ratio=0.3):
+    """可视化可通行区域、最大连通区域、自适应中心区域和采样点"""
+    
+    print(f"加载场景: {scene}")
+    planner = create_coverage_planner(scene=scene, coverage_radius=5.0, traversable_threshold=50.0)
+    
+    # 获取 trav_map
+    trav_map = planner.trav_map
+    
+    # 先采样，这样会计算最大连通区域和中心区域
+    sampled_points = planner.sample_points_mixed(100, max_cost=max_cost, center_ratio=center_ratio)
+    
+    # 创建可视化 - 3x2 布局
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    
+    # 1. 原始 traversability cost
+    ax1 = axes[0, 0]
+    im1 = ax1.imshow(trav_map, cmap='RdYlBu_r', vmin=0, vmax=50)
+    ax1.set_title(f'Traversability Cost\n(蓝=低cost, 红=高cost)')
+    plt.colorbar(im1, ax=ax1, label='Cost')
+    
+    # 2. 低 cost 安全区域 (cost < max_cost)
+    ax2 = axes[0, 1]
+    safe_mask = np.zeros_like(trav_map)
+    safe_count = 0
+    for cell in planner.traversable_cells:
+        row, col = cell
+        if trav_map[row, col] < max_cost:
+            safe_mask[row, col] = 1
+            safe_count += 1
+    ax2.imshow(safe_mask, cmap='Greens')
+    ax2.set_title(f'低 cost 区域 (cost < {max_cost})\n共 {safe_count} 个网格')
+    
+    # 3. 最大连通区域
+    ax3 = axes[0, 2]
+    largest_mask = np.zeros_like(trav_map)
+    if hasattr(planner, 'largest_safe_region') and planner.largest_safe_region:
+        for cell in planner.largest_safe_region:
+            largest_mask[cell[0], cell[1]] = 1
+        region_size = len(planner.largest_safe_region)
+    else:
+        region_size = 0
+    ax3.imshow(largest_mask, cmap='Oranges')
+    ax3.set_title(f'最大连通区域\n共 {region_size} 个网格')
+    
+    # 4. 距离变换图（新增）
+    ax4 = axes[1, 0]
+    if hasattr(planner, 'distance_map') and planner.distance_map is not None:
+        dist_map = planner.distance_map
+        im4 = ax4.imshow(dist_map, cmap='hot')
+        plt.colorbar(im4, ax=ax4, label='距离(格)')
+        max_dist = np.max(dist_map)
+        ax4.set_title(f'距离变换图\n(亮=远离边界, 最大距离={max_dist:.1f}格)')
+    else:
+        ax4.set_title('距离变换图\n(无数据)')
+    
+    # 5. 自适应中心区域
+    ax5 = axes[1, 1]
+    center_mask = np.zeros_like(trav_map)
+    if hasattr(planner, 'center_region') and planner.center_region:
+        for cell in planner.center_region:
+            center_mask[cell[0], cell[1]] = 1
+        center_size = len(planner.center_region)
+    else:
+        center_size = 0
+    
+    # 背景显示 trav_map
+    ax5.imshow(trav_map, cmap='RdYlBu_r', vmin=0, vmax=50, alpha=0.3)
+    # 最大连通区域边界 - 橙色
+    ax5.contour(largest_mask, colors='orange', linewidths=1, levels=[0.5])
+    # 中心区域 - 紫色填充
+    ax5.imshow(np.ma.masked_where(center_mask == 0, center_mask), cmap='Purples', alpha=0.5)
+    ax5.set_title(f'自适应中心区域 (ratio={center_ratio})\n橙线=原始边界, 紫色=中心区域 ({center_size}格)')
+    
+    # 6. 骨架（中线）和采样点
+    ax6 = axes[1, 2]
+    # 背景显示 trav_map
+    ax6.imshow(trav_map, cmap='RdYlBu_r', vmin=0, vmax=50, alpha=0.3)
+    # 叠加显示中心区域
+    ax6.imshow(np.ma.masked_where(center_mask == 0, center_mask), cmap='Purples', alpha=0.3)
+    
+    # 绘制骨架（中线）- 红色线
+    if hasattr(planner, 'skeleton_cells') and planner.skeleton_cells:
+        skeleton_rows = [c[0] for c in planner.skeleton_cells]
+        skeleton_cols = [c[1] for c in planner.skeleton_cells]
+        ax6.plot(skeleton_cols, skeleton_rows, 'r-', linewidth=1, alpha=0.7, label='中线')
+    
+    # 绘制采样点 - 绿色圆点
+    if len(sampled_points) > 0:
+        for point in sampled_points:
+            cell = planner._world2grid(point)
+            ax6.plot(cell[1], cell[0], 'go', markersize=8)
+    
+    skeleton_count = len(planner.skeleton_cells) if hasattr(planner, 'skeleton_cells') else 0
+    ax6.set_title(f'中线（红）和采样点（绿）\n中线 {skeleton_count} 点, 采样 {len(sampled_points)} 点')
+    ax6.legend()
+    
+    plt.tight_layout()
+    
+    # 保存图片
+    output_path = f'/tmp/trav_visualization_{scene}.png'
+    plt.savefig(output_path, dpi=150)
+    print(f"可视化已保存到: {output_path}")
+    
+    # 显示
+    plt.show()
+    
+    return planner
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--scene', type=str, default='Plaza', help='场景名称')
+    parser.add_argument('--max_cost', type=float, default=5.0, help='最大 cost 阈值')
+    parser.add_argument('--center_ratio', type=float, default=0.3, help='中心区域比例 (0-0.5)')
+    args = parser.parse_args()
+    
+    visualize_traversability(args.scene, args.max_cost, args.center_ratio)
+

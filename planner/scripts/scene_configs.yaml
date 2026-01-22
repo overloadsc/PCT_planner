@@ -1,0 +1,91 @@
+# 场景配置文件 - 统一格式
+# 所有场景都使用 routes 列表配置
+# 单路径 = routes 只有1个元素
+# 多路径 = routes 有多个元素
+
+scenes:
+  # ============ 螺旋场景 ============
+  Spiral:
+    tomo_file: spiral0.3_2
+    description: "螺旋场景"
+    execution_mode: "independent"  # 多路径时有效：sequential(串联) 或 independent(独立)
+    routes:
+      # 路径1：主要路径
+    - name: "route_1"
+      start_pos: [-16.0, -6.0]
+      end_pos: [-26.0, -5.0]
+      num_waypoints: 5
+      # 路径2：平行路径（如需单路径，删除此路径即可）
+    - name: "route_2"
+      start_pos: [-18.0, -8.0]
+      end_pos: [-24.0, -7.5]
+      num_waypoints: 4
+
+  # ============ 建筑场景 ============
+  Building:
+    tomo_file: AI_vol5_02_all
+    description: "建筑场景"
+    execution_mode: "independent"
+    routes:
+      # 单路径配置示例
+    - name: "main"
+      start_pos: [1.0, 0.0]
+      end_pos: [-1.0, 0.5]
+      num_waypoints: 3
+
+  # ============ 广场场景 ============
+  Plaza:
+    tomo_file: OldTown_all_new1
+    description: "广场场景"
+    execution_mode: "independent"
+    routes:
+      # 路径1：横跨场景的主路径
+    - name: "route_1"
+      start_pos: [6.39, -10.24]
+      end_pos: [-22.61, -20.24]
+      num_waypoints: 8
+      # 路径2：场景中部的独立路径
+    - name: "route_2"
+      start_pos: [22.95, -19.68]
+      end_pos: [6.70, -11.18]
+      num_waypoints: 6
+      # 路径3：楼梯场景适配路径
+    - name: "route_3"
+      start_pos: [-32.80, 30.07]
+      end_pos: [-33.05, 14.82]
+      num_waypoints: 8
+
+  # ============ 老城区场景 ============
+  Oldtown:
+    tomo_file: Oldtown
+    description: "老城区场景"
+    execution_mode: "sequential"  # 串联执行：按顺序走完所有路径
+    routes:
+      # 路径1：走楼梯场景适配路径
+    - name: "route_1"
+      start_pos: [-32.80, 30.07]
+      end_pos: [-33.05, 14.82]
+      num_waypoints: 8
+      # 路径2：第二段路径
+    - name: "route_2"
+      start_pos: [-33.55, 20.57]
+      end_pos: [-33.55, 29.57]
+      num_waypoints: 10
+  Blocks:
+    tomo_file: Blocks
+    description: Blocks场景
+    execution_mode: independent
+    routes:
+    - name: route_1
+      start_pos: [-61.84, -13.19]
+      end_pos: [1.91, -13.3]
+      num_waypoints: 0
+  Room1:
+    tomo_file: Room1
+    description: Room1场景
+    execution_mode: independent
+    routes:
+    - name: route_1
+      start_pos: [-1.9, 0.89]
+      end_pos: [-1.9, 4.39]
+      num_waypoints: 0
